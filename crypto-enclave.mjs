@@ -15,6 +15,8 @@ export class CryptoEnclave {
   }
 
   async generateAndSplitSecret(numShares, threshold) {
+    // ethers.Wallet.createRandom() uses a cryptographically secure random number generator (CSPRNG)
+    // to generate a 256-bit private key, which provides high entropy (well over 128 bits).
     const wallet = ethers.Wallet.createRandom();
     const privateKeyHex = wallet.privateKey.replace("0x", "");
     const privateKey = new Uint8Array(Buffer.from(privateKeyHex, "hex"));

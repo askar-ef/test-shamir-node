@@ -1,10 +1,10 @@
-import "dotenv/config"; // Load environment variables from .env file
+import "dotenv/config";
 import express from "express";
-import fs from "fs/promises"; // For file system operations
-import crypto from "crypto"; // For encryption (still needed for randomBytes for API_KEY fallback)
-import https from "https"; // Import https module
-import fsSync from "fs"; // Import synchronous fs for reading certificate files
-import { CryptoEnclave } from "./crypto-enclave.mjs"; // Import CryptoEnclave
+import fs from "fs/promises";
+import crypto from "crypto";
+import https from "https";
+import fsSync from "fs";
+import { CryptoEnclave } from "./crypto-enclave.mjs";
 
 const app = express();
 app.use(express.json());
@@ -15,17 +15,15 @@ const httpsOptions = {
   cert: fsSync.readFileSync("./certs/cert.pem"),
 };
 
-// For demonstration, use the same API_KEY as coordinator.
-// In a real application, each node should have its own securely managed API key.
 const API_KEY = process.env.API_KEY || "YOUR_COORDINATOR_API_KEY_HERE";
 const ENCRYPTION_KEY_HEX =
-  process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString("hex"); // 256-bit key
-// const IV_LENGTH = 16; // Moved to CryptoEnclave
+  process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString("hex");
 
-// Initialize CryptoEnclave for this node
+// Initialize CryptoEnclave for this node (Node 2 acts as the enclave handler)
 const nodeCrypto = new CryptoEnclave(ENCRYPTION_KEY_HEX);
 
-console.log("Node API Key:", API_KEY);
+console.log("Node 2 (Enclave) API Key:", API_KEY);
+console.log("Node 2 (Enclave) Encryption Key:", ENCRYPTION_KEY_HEX);
 
 // Middleware for API Key authentication
 const authenticateApiKey = (req, res, next) => {
@@ -38,9 +36,9 @@ const authenticateApiKey = (req, res, next) => {
 
 app.use(authenticateApiKey); // Apply authentication middleware to all routes
 
-const SHARE_FILE = `./node_share_${process.argv[2] || 3002}.enc`; // Changed port for node2
+const SHARE_FILE = `./node_share_${process.argv[2] || 3002}.enc`;
 
-// Encryption and Decryption functions are now handled by CryptoEnclave
+// Node 2 is responsible for handling the enclave operations (storing shares and managing sign requests)
 
 // Store share
 app.post("/store", async (req, res) => {
@@ -75,7 +73,6 @@ app.get("/get-share", async (req, res) => {
 });
 
 // Store pending sign requests
-// { requestId: { message: "...", status: "pending" | "approved" | "rejected" | "cancelled", timestamp: Date, timeoutId: Timeout } }
 let pendingSignRequests = {};
 const APPROVAL_TIMEOUT_MS = 60 * 1000; // 1 minute
 

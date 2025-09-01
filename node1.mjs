@@ -1,10 +1,10 @@
-import "dotenv/config"; // Load environment variables from .env file
+import "dotenv/config";
 import express from "express";
-import fs from "fs/promises"; // For file system operations
-import crypto from "crypto"; // For encryption (still needed for randomBytes for API_KEY fallback)
-import https from "https"; // Import https module
-import fsSync from "fs"; // Import synchronous fs for reading certificate files
-import { CryptoEnclave } from "./crypto-enclave.mjs"; // Import CryptoEnclave
+import fs from "fs/promises";
+import crypto from "crypto";
+import https from "https";
+import fsSync from "fs";
+import { OAuth2Client } from "google-auth-library"; // Import OAuth2Client for Google JWT verification
 
 const app = express();
 app.use(express.json());
@@ -15,17 +15,18 @@ const httpsOptions = {
   cert: fsSync.readFileSync("./certs/cert.pem"),
 };
 
-// For demonstration, use the same API_KEY as coordinator.
-// In a real application, each node should have its own securely managed API key.
-const API_KEY = process.env.API_KEY || "YOUR_COORDINATOR_API_KEY_HERE";
-const ENCRYPTION_KEY_HEX =
-  process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString("hex"); // 256-bit key
-// const IV_LENGTH = 16; // Moved to CryptoEnclave
+const API_KEY = process.env.API_KEY || "YOUR_COORDINATOR_API_KEY_HERE"; // API Key for inter-service communication
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID; // Google Client ID for JWT verification
 
-// Initialize CryptoEnclave for this node
-const nodeCrypto = new CryptoEnclave(ENCRYPTION_KEY_HEX);
+if (!GOOGLE_CLIENT_ID) {
+  console.error("GOOGLE_CLIENT_ID is not set in .env for Node 1.");
+  process.exit(1);
+}
 
-console.log("Node API Key:", API_KEY);
+const client = new OAuth2Client(GOOGLE_CLIENT_ID);
+
+console.log("Node 1 API Key:", API_KEY);
+console.log("Node 1 Google Client ID:", GOOGLE_CLIENT_ID);
 
 // Middleware for API Key authentication
 const authenticateApiKey = (req, res, next) => {
@@ -38,161 +39,29 @@ const authenticateApiKey = (req, res, next) => {
 
 app.use(authenticateApiKey); // Apply authentication middleware to all routes
 
-const SHARE_FILE = `./node_share_${process.argv[2] || 3001}.enc`;
-
-// Encryption and Decryption functions are now handled by CryptoEnclave
-
-// Store share
-app.post("/store", async (req, res) => {
+// Endpoint to validate Google JWT
+app.post("/validate-jwt", async (req, res) => {
   try {
-    const share = req.body.share;
-    if (!share) {
-      return res.status(400).json({ error: "Share is required" });
-    }
-    const encryptedShare = nodeCrypto.encrypt(share);
-    await fs.writeFile(SHARE_FILE, encryptedShare);
-    console.log("Stored and encrypted share to file:", SHARE_FILE);
-    res.json({ status: "ok" });
-  } catch (err) {
-    console.error("Error storing share:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Return share
-app.get("/get-share", async (req, res) => {
-  try {
-    const encryptedShare = await fs.readFile(SHARE_FILE, "utf8");
-    const decryptedShare = nodeCrypto.decrypt(encryptedShare);
-    res.json({ share: decryptedShare });
-  } catch (err) {
-    if (err.code === "ENOENT") {
-      return res.status(400).json({ error: "No share stored" });
-    }
-    console.error("Error retrieving share:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Store pending sign requests
-// { requestId: { message: "...", status: "pending" | "approved" | "rejected" | "cancelled", timestamp: Date, timeoutId: Timeout } }
-let pendingSignRequests = {};
-const APPROVAL_TIMEOUT_MS = 60 * 1000; // 1 minute
-
-// Endpoint to request signing
-app.post("/request-sign", async (req, res) => {
-  try {
-    const { message, requestId } = req.body;
-    if (!message || !requestId) {
-      return res
-        .status(400)
-        .json({ error: "Message and requestId are required" });
+    const { token } = req.body;
+    if (!token) {
+      return res.status(400).json({ error: "JWT token is required" });
     }
 
-    if (pendingSignRequests[requestId]) {
-      return res.status(409).json({ error: "Request ID already exists" });
-    }
-
-    const timeoutId = setTimeout(() => {
-      if (
-        pendingSignRequests[requestId] &&
-        pendingSignRequests[requestId].status === "pending"
-      ) {
-        pendingSignRequests[requestId].status = "cancelled";
-        console.log(
-          `Sign request ${requestId} for message: "${message}" cancelled due to timeout.`
-        );
-      }
-    }, APPROVAL_TIMEOUT_MS);
-
-    pendingSignRequests[requestId] = {
-      message,
-      status: "pending",
-      timestamp: new Date(),
-      timeoutId: timeoutId,
-    };
-    console.log(
-      `Received sign request ${requestId} for message: "${message}". Waiting for manual approval.`
-    );
-    console.log(
-      `Approve manually via: curl -k -X POST https://localhost:${
-        process.argv[2] || 3001
-      }/approve/${requestId} -H "X-API-Key: ${API_KEY}"`
-    );
-    console.log(
-      `Reject manually via: curl -k -X POST https://localhost:${
-        process.argv[2] || 3001
-      }/reject/${requestId} -H "X-API-Key: ${API_KEY}"`
-    );
-
-    res.json({
-      status: "pending_approval",
-      requestId: requestId,
-      message: message,
-      expires_in_ms:
-        APPROVAL_TIMEOUT_MS -
-        (new Date() - pendingSignRequests[requestId].timestamp),
+    const ticket = await client.verifyIdToken({
+      idToken: token,
+      audience: GOOGLE_CLIENT_ID,
     });
-  } catch (err) {
-    console.error("Error in /request-sign:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+    const payload = ticket.getPayload();
+    const userid = payload["sub"];
 
-// Endpoint for manual approval
-app.post("/approve/:requestId", (req, res) => {
-  const { requestId } = req.params;
-  if (!pendingSignRequests[requestId]) {
-    return res
-      .status(404)
-      .json({ error: "Sign request not found or already processed" });
+    console.log(`JWT from user ${userid} validated successfully.`);
+    res.json({ status: "valid", userid: userid, email: payload.email });
+  } catch (error) {
+    console.error("Error validating JWT:", error);
+    res
+      .status(401)
+      .json({ error: "Invalid JWT token", details: error.message });
   }
-  if (pendingSignRequests[requestId].status !== "pending") {
-    return res.status(409).json({
-      error: `Sign request already ${pendingSignRequests[requestId].status}`,
-    });
-  }
-
-  clearTimeout(pendingSignRequests[requestId].timeoutId);
-  pendingSignRequests[requestId].status = "approved";
-  console.log(`Sign request ${requestId} approved manually.`);
-  res.json({ status: "approved", requestId: requestId });
-});
-
-// Endpoint for manual rejection
-app.post("/reject/:requestId", (req, res) => {
-  const { requestId } = req.params;
-  if (!pendingSignRequests[requestId]) {
-    return res
-      .status(404)
-      .json({ error: "Sign request not found or already processed" });
-  }
-  if (pendingSignRequests[requestId].status !== "pending") {
-    return res.status(409).json({
-      error: `Sign request already ${pendingSignRequests[requestId].status}`,
-    });
-  }
-
-  clearTimeout(pendingSignRequests[requestId].timeoutId);
-  pendingSignRequests[requestId].status = "rejected";
-  console.log(`Sign request ${requestId} rejected manually.`);
-  res.json({ status: "rejected", requestId: requestId });
-});
-
-// Endpoint for coordinator to check request status
-app.get("/status/:requestId", (req, res) => {
-  const { requestId } = req.params;
-  if (!pendingSignRequests[requestId]) {
-    return res.status(404).json({ error: "Sign request not found" });
-  }
-  const { message, status, timestamp } = pendingSignRequests[requestId];
-  res.json({
-    requestId,
-    message,
-    status,
-    timestamp,
-    expires_in_ms: APPROVAL_TIMEOUT_MS - (new Date() - new Date(timestamp)),
-  });
 });
 
 const port = process.argv[2] || 3001;
