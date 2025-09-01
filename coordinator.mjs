@@ -70,127 +70,93 @@ app.post("/generate", async (req, res) => {
 // Request signing
 app.post("/sign", async (req, res) => {
   try {
-    const { message } = req.body;
+    const { message, token } = req.body; // accept token from caller (Main App)
     if (!message) return res.status(400).json({ error: "Message is required" });
     if (!currentWallet || !currentWallet.address)
       return res.status(400).json({ error: "No wallet yet" });
 
-    const requestId = uuidv4();
-    const requiredApprovals = 2;
-    const COORDINATOR_TIMEOUT_MS = 70 * 1000;
-
-    const requestSignPromises = nodes.map((nodeUrl) =>
-      fetch(`${nodeUrl}/request-sign`, {
+    // 1) Validate token by asking Node1
+    if (!token) return res.status(400).json({ error: "Token is required" });
+    let vjson;
+    try {
+      const vresp = await fetch(`${nodes[0]}/validate-jwt`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "X-API-Key": API_KEY,
         },
-        body: JSON.stringify({ message, requestId }),
+        body: JSON.stringify({ token }),
+        agent: fetchAgent,
+      });
+      const vtext = await vresp.text();
+      try {
+        vjson = JSON.parse(vtext);
+      } catch (e) {
+        console.error("Invalid JSON from Node1 validate-jwt:", vtext);
+        return res.status(502).json({ error: "Invalid response from Node1", body: vtext });
+      }
+      if (!vresp.ok || vjson.status !== "valid") {
+        console.log("Token validation failed at Node1:", vjson);
+        return res.status(401).json({ error: "Invalid token", details: vjson });
+      }
+    } catch (err) {
+      console.error("Error validating token with Node1:", err);
+      return res.status(500).json({ error: "Token validation error", details: err.message });
+    }
+
+    // 2) Fetch shares from all nodes immediately
+    const shareFetches = nodes.map((nodeUrl) =>
+      fetch(`${nodeUrl}/get-share`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": API_KEY,
+        },
         agent: fetchAgent,
       })
-        .then((response) => response.json())
-        .then((data) => ({
-          node: nodeUrl,
-          status: data.status,
-          requestId: data.requestId,
-          expires_in_ms: data.expires_in_ms,
-        }))
-        .catch((error) => ({
-          node: nodeUrl,
-          status: "error",
-          error: error.message,
-        }))
-    );
-
-    const requestSignResults = await Promise.all(requestSignPromises);
-    console.log("Request Sign Results:", requestSignResults);
-
-    const nodesAwaitingApproval = requestSignResults.filter(
-      (result) => result.status === "pending_approval"
-    );
-
-    if (nodesAwaitingApproval.length < requiredApprovals) {
-      return res.status(400).json({
-        error:
-          "Not enough nodes available or willing to process signing request.",
-      });
-    }
-
-    let approvedNodes = [];
-    const startTime = Date.now();
-
-    while (
-      approvedNodes.length < requiredApprovals &&
-      Date.now() - startTime < COORDINATOR_TIMEOUT_MS
-    ) {
-      const statusCheckPromises = nodesAwaitingApproval.map((node) =>
-        fetch(`${node.node}/status/${requestId}`, {
-          headers: { "X-API-Key": API_KEY },
-          agent: fetchAgent, // Use the agent to ignore self-signed certs
+        .then(async (r) => {
+          const text = await r.text();
+          if (!r.ok) {
+            let body = text;
+            try { body = JSON.parse(text); } catch(e) {}
+            throw new Error(`${nodeUrl} returned ${r.status}: ${JSON.stringify(body)}`);
+          }
+          try {
+            return JSON.parse(text);
+          } catch (e) {
+            throw new Error(`Invalid JSON from ${nodeUrl}: ${text}`);
+          }
         })
-          .then((response) => response.json())
-          .then((data) => ({
-            node: node.node,
-            status: data.status,
-            requestId: data.requestId,
-          }))
-          .catch((error) => ({
-            node: node.node,
-            status: "error",
-            error: error.message,
-          }))
-      );
-
-      const statusResults = await Promise.all(statusCheckPromises);
-      approvedNodes = statusResults.filter(
-        (result) => result.status === "approved"
-      );
-      console.log(
-        `Polling for approvals... Current approved: ${approvedNodes.length}/${requiredApprovals}`
-      );
-
-      if (approvedNodes.length < requiredApprovals) {
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-      }
-    }
-
-    if (approvedNodes.length < requiredApprovals) {
-      console.log(
-        `Timeout: Not enough approvals (${
-          approvedNodes.length
-        }/${requiredApprovals}) received within ${
-          COORDINATOR_TIMEOUT_MS / 1000
-        } seconds.`
-      );
-      return res.status(408).json({
-        error: `Timeout: Not enough approvals (${approvedNodes.length}/${requiredApprovals}) to sign the message.`,
-      });
-    }
-
-    const encryptedSharesToCombine = [];
-    for (const node of approvedNodes) {
-      const shareResponse = await fetch(`${node.node}/get-share`, {
-        headers: { "X-API-Key": API_KEY },
-        agent: fetchAgent,
-      });
-      const shareData = await shareResponse.json();
-      if (shareData.share) {
-        encryptedSharesToCombine.push(shareData.share);
-      } else {
-        throw new Error(`Failed to get share from ${node.node}`);
-      }
-    }
-
-    const signature = await coordinatorCrypto.signMessageWithShares(
-      encryptedSharesToCombine,
-      message
+        .catch((err) => ({ error: err.message, node: nodeUrl }))
     );
 
+    const shareResults = await Promise.all(shareFetches);
+
+    const encryptedShares = [];
+    for (const r of shareResults) {
+      if (r && r.error) {
+        console.error("Failed to get share:", r);
+        return res.status(502).json({ error: "Failed to fetch shares from nodes", details: r });
+      }
+      if (!r.share) {
+        console.error("Node returned no share:", r);
+        return res.status(502).json({ error: "Node did not return share", details: r });
+      }
+      encryptedShares.push(r.share);
+    }
+
+    // 3) Combine & sign in coordinator enclave
+    let signature;
+    try {
+      signature = await coordinatorCrypto.signMessageWithShares(encryptedShares, message);
+    } catch (err) {
+      console.error("Error combining shares/signing:", err);
+      return res.status(500).json({ error: "Signing error", details: err.message });
+    }
+
+    // 4) Return signature + wallet address
     res.json({
       signature,
-      requestId,
-      approvedNodes: approvedNodes.map((r) => r.node),
       walletAddress: currentWallet.address,
     });
   } catch (err) {

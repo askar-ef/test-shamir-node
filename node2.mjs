@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import fs from "fs/promises";
 import crypto from "crypto";
+import fetch from "node-fetch";
 import https from "https";
 import fsSync from "fs";
 import { CryptoEnclave } from "./crypto-enclave.mjs";
@@ -76,14 +77,50 @@ app.get("/get-share", async (req, res) => {
 let pendingSignRequests = {};
 const APPROVAL_TIMEOUT_MS = 60 * 1000; // 1 minute
 
-// Endpoint to request signing
+const NODE1_URL = process.env.NODE1_URL || "https://localhost:3001";
+
+// create https agent to ignore self-signed certs for local calls to node1
+const agent = new https.Agent({
+  rejectUnauthorized: false,
+  secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
+  ca: fsSync.readFileSync("./certs/cert.pem"),
+});
+const fetchAgent = (parsedURL) => {
+  try {
+    return parsedURL.protocol === "https:" ? agent : undefined;
+  } catch (e) {
+    return undefined;
+  }
+};
+
+// Endpoint to request signing (now validates token by calling Node1)
 app.post("/request-sign", async (req, res) => {
   try {
-    const { message, requestId } = req.body;
-    if (!message || !requestId) {
-      return res
-        .status(400)
-        .json({ error: "Message and requestId are required" });
+    const { message, requestId, token } = req.body;
+    if (!message || !requestId || !token) {
+      return res.status(400).json({ error: "Message, requestId and token are required" });
+    }
+
+    // Verify token by asking Node1
+    try {
+      const vres = await fetch(`${NODE1_URL}/validate-jwt`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": API_KEY,
+        },
+        body: JSON.stringify({ token }),
+        agent: fetchAgent,
+      });
+      const vjson = await vres.json();
+      if (!vres.ok || vjson.status !== "valid") {
+        console.error("Token validation at Node1 failed:", vjson);
+        return res.status(401).json({ error: "Invalid token", details: vjson });
+      }
+      console.log("Node2: token validated for user:", vjson.userid);
+    } catch (err) {
+      console.error("Error validating token with Node1:", err);
+      return res.status(500).json({ error: "Token validation error", details: err.message });
     }
 
     if (pendingSignRequests[requestId]) {
@@ -96,9 +133,7 @@ app.post("/request-sign", async (req, res) => {
         pendingSignRequests[requestId].status === "pending"
       ) {
         pendingSignRequests[requestId].status = "cancelled";
-        console.log(
-          `Sign request ${requestId} for message: "${message}" cancelled due to timeout.`
-        );
+        console.log(`Sign request ${requestId} cancelled due to timeout.`);
       }
     }, APPROVAL_TIMEOUT_MS);
 
@@ -108,19 +143,7 @@ app.post("/request-sign", async (req, res) => {
       timestamp: new Date(),
       timeoutId: timeoutId,
     };
-    console.log(
-      `Received sign request ${requestId} for message: "${message}". Waiting for manual approval.`
-    );
-    console.log(
-      `Approve manually via: curl -k -X POST https://localhost:${
-        process.argv[2] || 3002
-      }/approve/${requestId} -H "X-API-Key: ${API_KEY}"`
-    );
-    console.log(
-      `Reject manually via: curl -k -X POST https://localhost:${
-        process.argv[2] || 3002
-      }/reject/${requestId} -H "X-API-Key: ${API_KEY}"`
-    );
+    console.log(`Received sign request ${requestId} for message: "${message}". Waiting for manual approval.`);
 
     res.json({
       status: "pending_approval",
