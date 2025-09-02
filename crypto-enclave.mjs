@@ -2,7 +2,7 @@ import { split, combine } from "shamir-secret-sharing";
 import crypto from "crypto";
 import { ethers } from "ethers";
 
-const IV_LENGTH = 16;
+const IV_LENGTH = 12;
 
 export class CryptoError extends Error {
   constructor(message, code = 'CRYPTO_ERROR', details = {}) {
@@ -118,13 +118,13 @@ export class CryptoEnclave {
 
     try {
       const iv = crypto.randomBytes(IV_LENGTH);
-      const cipher = crypto.createCipheriv(
-        "aes-256-cbc",
-        this.encryptionKey,
-        iv
-      );
-      const encrypted = Buffer.concat([cipher.update(text), cipher.final()]);
-      return `${iv.toString("hex")}:${encrypted.toString("hex")}`;
+      const cipher = crypto.createCipheriv("aes-256-gcm", this.encryptionKey, iv);
+
+      const encrypted = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+      const authTag = cipher.getAuthTag();
+
+      // simpan IV + ciphertext + authTag
+      return `${iv.toString("hex")}:${encrypted.toString("hex")}:${authTag.toString("hex")}`;
     } catch (error) {
       throw new CryptoError('Encryption failed', 'ENCRYPTION_ERROR', { 
         error: error.message 
@@ -133,35 +133,33 @@ export class CryptoEnclave {
   }
 
   decrypt(text) {
-    if (!text?.includes(":")) {
-      throw new CryptoError('Invalid encrypted format', 'INVALID_ENCRYPTED_FORMAT');
+  if (!text?.includes(":")) {
+    throw new CryptoError('Invalid encrypted format', 'INVALID_ENCRYPTED_FORMAT');
+  }
+
+  try {
+    const [ivHex, encryptedHex, authTagHex] = text.split(":");
+    if (!ivHex || !encryptedHex || !authTagHex) {
+      throw new CryptoError('Missing IV, ciphertext, or authTag', 'INVALID_ENCRYPTED_DATA');
     }
 
-    try {
-      const [ivHex, encryptedHex] = text.split(":");
-      if (!ivHex || !encryptedHex) {
-        throw new CryptoError('Missing IV or encrypted data', 'INVALID_ENCRYPTED_DATA');
-      }
+    const iv = Buffer.from(ivHex, "hex");
+    const encryptedText = Buffer.from(encryptedHex, "hex");
+    const authTag = Buffer.from(authTagHex, "hex");
 
-      const iv = Buffer.from(ivHex, "hex");
-      const encryptedText = Buffer.from(encryptedHex, "hex");
-      
-      const decipher = crypto.createDecipheriv(
-        "aes-256-cbc",
-        this.encryptionKey,
-        iv
-      );
-      
-      const decrypted = Buffer.concat([
-        decipher.update(encryptedText),
-        decipher.final()
-      ]);
-      
-      return decrypted.toString();
-    } catch (error) {
-      if (error instanceof CryptoError) throw error;
-      throw new CryptoError('Decryption failed', 'DECRYPTION_ERROR', { 
-        error: error.message 
+    const decipher = crypto.createDecipheriv("aes-256-gcm", this.encryptionKey, iv);
+    decipher.setAuthTag(authTag);
+
+    const decrypted = Buffer.concat([
+      decipher.update(encryptedText),
+      decipher.final()
+    ]);
+
+    return decrypted.toString("utf8");
+  } catch (error) {
+    if (error instanceof CryptoError) throw error;
+    throw new CryptoError('Decryption failed', 'DECRYPTION_ERROR', { 
+      error: error.message 
       });
     }
   }
