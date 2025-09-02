@@ -49,6 +49,40 @@ const coordinatorCrypto = new CryptoEnclave(
 // State
 let currentWallet = null;
 
+// User wallet storage
+const USER_WALLETS_FILE = './user-wallets.json';
+
+// Load user wallets from file
+function loadUserWallets() {
+  try {
+    if (fs.existsSync(USER_WALLETS_FILE)) {
+      const data = fs.readFileSync(USER_WALLETS_FILE, 'utf8');
+      return JSON.parse(data);
+    }
+  } catch (error) {
+    console.error('Error loading user wallets:', error);
+  }
+  return {};
+}
+
+// Save user wallets to file
+function saveUserWallets(wallets) {
+  try {
+    fs.writeFileSync(USER_WALLETS_FILE, JSON.stringify(wallets, null, 2));
+  } catch (error) {
+    console.error('Error saving user wallets:', error);
+  }
+}
+
+// Get user wallets (lazy load)
+let userWallets = null;
+function getUserWallets() {
+  if (userWallets === null) {
+    userWallets = loadUserWallets();
+  }
+  return userWallets;
+}
+
 // Middleware
 const validateApiKey = (req, res, next) => {
   const apiKey = req.headers["x-api-key"];
@@ -123,7 +157,27 @@ const fetchWithRetry = async (url, options, maxRetries = 3) => {
 // Routes
 app.post("/generate", async (req, res, next) => {
   try {
-    // Generate and split the secret
+    const { userId, email } = req.body;
+
+    if (!email) {
+      throw new CoordinatorError("Email is required", "MISSING_EMAIL", {}, 400);
+    }
+
+    const wallets = getUserWallets();
+
+    // Check if wallet already exists for this email
+    if (wallets[email]) {
+      console.log(`Reusing existing wallet for email: ${email}`);
+      currentWallet = { address: wallets[email].address };
+      res.json({
+        address: wallets[email].address,
+        reused: true
+      });
+      return;
+    }
+
+    // Generate new wallet
+    console.log(`Creating new wallet for email: ${email}`);
     const { address, encryptedShares } = await coordinatorCrypto.generateAndSplitSecret(2, 2);
 
     // Distribute shares to nodes
@@ -135,13 +189,21 @@ app.post("/generate", async (req, res, next) => {
             "Content-Type": "application/json",
             "X-API-Key": API_KEY,
           },
-          body: JSON.stringify({ share })
+          body: JSON.stringify({ share, email })
         })
       )
     );
 
+    // Save wallet mapping (only metadata, no shares for MPC security)
+    wallets[email] = {
+      address,
+      userId,
+      createdAt: new Date().toISOString()
+    };
+    saveUserWallets(wallets);
+
     currentWallet = { address };
-    res.json({ address, shares: encryptedShares });
+    res.json({ address, reused: false });
   } catch (error) {
     if (error instanceof CryptoError) {
       next(new CoordinatorError(
@@ -197,7 +259,7 @@ app.post("/sign", async (req, res, next) => {
     const shareResults = await Promise.all(
       nodes.map(nodeUrl =>
         fetchWithRetry(
-          `${nodeUrl}/get-share`,
+          `${nodeUrl}/get-share?email=${encodeURIComponent(validationResult.email)}`,
           {
             method: "GET",
             headers: {

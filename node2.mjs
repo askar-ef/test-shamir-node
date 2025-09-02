@@ -31,7 +31,16 @@ const httpsOptions = {
 };
 
 const API_KEY = process.env.API_KEY || "YOUR_COORDINATOR_API_KEY_HERE";
-const SHARE_FILE = `./node_share_${process.argv[2] || 3002}.enc`;
+
+// Utility function to get share file path for email
+const getShareFilePath = (email, port = process.argv[2] || 3002) => {
+  if (!email) {
+    throw new NodeError("Email is required for share file", "MISSING_EMAIL", {}, 400);
+  }
+  // Sanitize email for filename
+  const sanitizedEmail = email.replace(/[^a-zA-Z0-9@._-]/g, '_');
+  return `./node_share_${port}_${sanitizedEmail}.enc`;
+};
 
 // Middleware
 const authenticateApiKey = (req, res, next) => {
@@ -62,11 +71,41 @@ app.use(authenticateApiKey);
 // Routes
 app.get("/get-share", async (req, res, next) => {
   try {
-    const encryptedShare = await fsSync.readFileSync(SHARE_FILE, "utf8");
+    const { email } = req.query;
+    if (!email) {
+      throw new NodeError("Email parameter is required", "MISSING_EMAIL", {}, 400);
+    }
+
+    let shareFile;
+    let encryptedShare;
+
+    // Try email-specific file first (new format)
+    try {
+      shareFile = getShareFilePath(email);
+      encryptedShare = await fsSync.readFileSync(shareFile, "utf8");
+      console.log(`Found email-specific share file: ${shareFile}`);
+    } catch (emailSpecificError) {
+      if (emailSpecificError.code === "ENOENT") {
+        // Fall back to old global file format for backward compatibility
+        const oldShareFile = `./node_share_${process.argv[2] || 3002}.enc`;
+        try {
+          encryptedShare = await fsSync.readFileSync(oldShareFile, "utf8");
+          console.log(`Using legacy share file: ${oldShareFile} for email: ${email}`);
+          shareFile = oldShareFile;
+        } catch (oldFileError) {
+          throw new NodeError("No share stored for this email", "NO_SHARE", {}, 404);
+        }
+      } else {
+        throw emailSpecificError;
+      }
+    }
+
     res.json({ share: encryptedShare });
   } catch (err) {
     if (err.code === "ENOENT") {
-      next(new NodeError("No share stored", "NO_SHARE", {}, 404));
+      next(new NodeError("No share stored for this email", "NO_SHARE", {}, 404));
+    } else if (err instanceof NodeError) {
+      next(err);
     } else {
       next(new NodeError(
         "Error retrieving share",
@@ -80,21 +119,37 @@ app.get("/get-share", async (req, res, next) => {
 
 app.post("/store", async (req, res, next) => {
   try {
-    const { share } = req.body;
+    const { share, email } = req.body;
     if (!share) {
       throw new NodeError("Share is required", "MISSING_SHARE", {}, 400);
     }
 
-    await fsSync.writeFileSync(SHARE_FILE, share);
-    console.log("Share stored successfully");
+    let shareFile;
+
+    if (email) {
+      // New format: email-specific file
+      shareFile = getShareFilePath(email);
+      console.log(`Storing share in email-specific file: ${shareFile}`);
+    } else {
+      // Legacy format: global file (for backward compatibility)
+      shareFile = `./node_share_${process.argv[2] || 3002}.enc`;
+      console.log(`Storing share in legacy file: ${shareFile}`);
+    }
+
+    await fsSync.writeFileSync(shareFile, share);
+    console.log(`Share stored successfully for ${email ? `email: ${email}` : 'legacy format'}`);
     res.json({ status: "ok" });
   } catch (err) {
-    next(new NodeError(
-      "Error storing share",
-      "SHARE_WRITE_ERROR",
-      { error: err.message },
-      500
-    ));
+    if (err instanceof NodeError) {
+      next(err);
+    } else {
+      next(new NodeError(
+        "Error storing share",
+        "SHARE_WRITE_ERROR",
+        { error: err.message },
+        500
+      ));
+    }
   }
 });
 

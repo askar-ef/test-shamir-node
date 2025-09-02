@@ -238,6 +238,9 @@ app.get(
       }
 
       req.session.walletAddress = generateResult.address;
+      req.session.walletReused = generateResult.reused || false;
+
+      console.log(`Wallet ${generateResult.reused ? 'reused' : 'created'} for email: ${validationResult.email || req.user.emails?.[0]?.value}`);
       res.redirect("/dashboard");
     } catch (error) {
       next(error);
@@ -249,11 +252,14 @@ app.get("/dashboard", ensureAuthenticated, (req, res) => {
   const wallet = req.session.walletAddress || "Not generated yet";
   const signature = req.session.combineSignature || "Not signed yet";
   const email = req.user.emails?.[0]?.value;
-  
+  const walletStatus = req.session.walletReused !== undefined
+    ? (req.session.walletReused ? " (Reused existing wallet)" : " (New wallet created)")
+    : "";
+
   res.send(`
     <h1>Welcome, ${req.user.displayName}!</h1>
     <p>Email: ${email}</p>
-    <p>Wallet: ${wallet}</p>
+    <p>Wallet: ${wallet}${walletStatus}</p>
     <p>Last signature: ${signature}</p>
     <a href="/sign-message">Sign a Message</a><br>
     <a href="/logout">Logout</a>
