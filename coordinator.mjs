@@ -4,10 +4,34 @@ import fetch from "node-fetch";
 import crypto from "crypto";
 import https from "https";
 import fs from "fs";
-import { CryptoEnclave } from "./crypto-enclave.mjs";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import { CryptoEnclave, CryptoError } from "./crypto-enclave.mjs";
+
+class CoordinatorError extends Error {
+  constructor(message, code = 'COORDINATOR_ERROR', details = {}, statusCode = 500) {
+    super(message);
+    this.code = code;
+    this.details = details;
+    this.statusCode = statusCode;
+  }
+}
 
 const app = express();
+
+// Security middleware
+app.use(helmet());
 app.use(express.json());
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+}));
+
+// HTTPS Configuration
+const httpsOptions = {
+  key: fs.readFileSync("./certs/key.pem"),
+  cert: fs.readFileSync("./certs/cert.pem"),
+};
 
 const agent = new https.Agent({
   rejectUnauthorized: false,
@@ -15,155 +39,208 @@ const agent = new https.Agent({
   ca: fs.readFileSync("./certs/cert.pem"),
 });
 
-const fetchAgent = (parsedURL) => {
-  try {
-    return parsedURL.protocol === "https:" ? agent : undefined;
-  } catch (e) {
-    return undefined;
-  }
-};
-
-const httpsOptions = {
-  key: fs.readFileSync("./certs/key.pem"),
-  cert: fs.readFileSync("./certs/cert.pem"),
-};
-
+// Configuration
 const API_KEY = process.env.API_KEY || crypto.randomBytes(32).toString("hex");
-console.log("Coordinator API Key:", API_KEY);
-
 const nodes = ["https://localhost:3001", "https://localhost:3002"];
-
-let currentWallet = null;
-
 const coordinatorCrypto = new CryptoEnclave(
   process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString("hex")
 );
 
-app.post("/generate", async (req, res) => {
-  try {
-    const { address, encryptedShares } =
-      await coordinatorCrypto.generateAndSplitSecret(2, 2);
+// State
+let currentWallet = null;
 
+// Middleware
+const validateApiKey = (req, res, next) => {
+  const apiKey = req.headers["x-api-key"];
+  if (!apiKey || apiKey !== API_KEY) {
+    throw new CoordinatorError("Invalid API Key", "INVALID_API_KEY", {}, 401);
+  }
+  next();
+};
+
+const errorHandler = (err, req, res, next) => {
+  console.error("Error:", {
+    code: err.code,
+    message: err.message,
+    details: err.details,
+    stack: err.stack
+  });
+
+  res.status(err.statusCode || 500).json({
+    error: err.message,
+    code: err.code,
+    details: err.details
+  });
+};
+
+app.use(validateApiKey);
+
+// Utility functions
+const fetchWithRetry = async (url, options, maxRetries = 3) => {
+  let lastError;
+  
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const response = await fetch(url, {
+        ...options,
+        agent: options.agent || ((new URL(url)).protocol === 'https:' ? agent : undefined)
+      });
+      
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        throw new CoordinatorError(
+          "Invalid JSON response", 
+          "INVALID_RESPONSE",
+          { url, responseText: text },
+          502
+        );
+      }
+
+      if (!response.ok) {
+        throw new CoordinatorError(
+          data.error || "Request failed",
+          "NODE_ERROR",
+          { url, response: data },
+          response.status
+        );
+      }
+
+      return data;
+    } catch (error) {
+      lastError = error;
+      if (i < maxRetries - 1) {
+        await new Promise(r => setTimeout(r, Math.pow(2, i) * 1000));
+      }
+    }
+  }
+  
+  throw lastError;
+};
+
+// Routes
+app.post("/generate", async (req, res, next) => {
+  try {
+    // Generate and split the secret
+    const { address, encryptedShares } = await coordinatorCrypto.generateAndSplitSecret(2, 2);
+
+    // Distribute shares to nodes
     await Promise.all(
       encryptedShares.map((share, i) =>
-        fetch(`${nodes[i]}/store`, {
+        fetchWithRetry(`${nodes[i]}/store`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             "X-API-Key": API_KEY,
           },
-          body: JSON.stringify({ share }),
-          agent: fetchAgent,
+          body: JSON.stringify({ share })
         })
       )
     );
 
-    currentWallet = { address: address };
+    currentWallet = { address };
     res.json({ address, shares: encryptedShares });
-  } catch (err) {
-    console.error("Error in /generate:", err);
-    res.status(500).json({ error: err.message });
+  } catch (error) {
+    if (error instanceof CryptoError) {
+      next(new CoordinatorError(
+        "Wallet generation failed",
+        "GENERATION_ERROR",
+        { cryptoError: error },
+        500
+      ));
+    } else {
+      next(error);
+    }
   }
 });
 
-// Request signing
-app.post("/sign", async (req, res) => {
+app.post("/sign", async (req, res, next) => {
   try {
-    const { message, token } = req.body; // accept token from caller (Main App)
-    if (!message) return res.status(400).json({ error: "Message is required" });
-    if (!currentWallet || !currentWallet.address)
-      return res.status(400).json({ error: "No wallet yet" });
+    const { message, token } = req.body;
+    
+    // Input validation
+    if (!message) {
+      throw new CoordinatorError("Message is required", "MISSING_MESSAGE", {}, 400);
+    }
+    if (!token) {
+      throw new CoordinatorError("Token is required", "MISSING_TOKEN", {}, 400);
+    }
+    if (!currentWallet?.address) {
+      throw new CoordinatorError("No wallet initialized", "NO_WALLET", {}, 400);
+    }
 
-    // 1) Validate token by asking Node1
-    if (!token) return res.status(400).json({ error: "Token is required" });
-    let vjson;
-    try {
-      const vresp = await fetch(`${nodes[0]}/validate-jwt`, {
+    // 1. Validate token with Node1
+    const validationResult = await fetchWithRetry(
+      `${nodes[0]}/validate-jwt`,
+      {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "X-API-Key": API_KEY,
         },
-        body: JSON.stringify({ token }),
-        agent: fetchAgent,
-      });
-      const vtext = await vresp.text();
-      try {
-        vjson = JSON.parse(vtext);
-      } catch (e) {
-        console.error("Invalid JSON from Node1 validate-jwt:", vtext);
-        return res.status(502).json({ error: "Invalid response from Node1", body: vtext });
+        body: JSON.stringify({ token })
       }
-      if (!vresp.ok || vjson.status !== "valid") {
-        console.log("Token validation failed at Node1:", vjson);
-        return res.status(401).json({ error: "Invalid token", details: vjson });
-      }
-    } catch (err) {
-      console.error("Error validating token with Node1:", err);
-      return res.status(500).json({ error: "Token validation error", details: err.message });
-    }
-
-    // 2) Fetch shares from all nodes immediately
-    const shareFetches = nodes.map((nodeUrl) =>
-      fetch(`${nodeUrl}/get-share`, {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-          "X-API-Key": API_KEY,
-        },
-        agent: fetchAgent,
-      })
-        .then(async (r) => {
-          const text = await r.text();
-          if (!r.ok) {
-            let body = text;
-            try { body = JSON.parse(text); } catch(e) {}
-            throw new Error(`${nodeUrl} returned ${r.status}: ${JSON.stringify(body)}`);
-          }
-          try {
-            return JSON.parse(text);
-          } catch (e) {
-            throw new Error(`Invalid JSON from ${nodeUrl}: ${text}`);
-          }
-        })
-        .catch((err) => ({ error: err.message, node: nodeUrl }))
     );
 
-    const shareResults = await Promise.all(shareFetches);
-
-    const encryptedShares = [];
-    for (const r of shareResults) {
-      if (r && r.error) {
-        console.error("Failed to get share:", r);
-        return res.status(502).json({ error: "Failed to fetch shares from nodes", details: r });
-      }
-      if (!r.share) {
-        console.error("Node returned no share:", r);
-        return res.status(502).json({ error: "Node did not return share", details: r });
-      }
-      encryptedShares.push(r.share);
+    if (validationResult.status !== "valid") {
+      throw new CoordinatorError(
+        "Token validation failed",
+        "INVALID_TOKEN",
+        { validation: validationResult },
+        401
+      );
     }
 
-    // 3) Combine & sign in coordinator enclave
-    let signature;
-    try {
-      signature = await coordinatorCrypto.signMessageWithShares(encryptedShares, message);
-    } catch (err) {
-      console.error("Error combining shares/signing:", err);
-      return res.status(500).json({ error: "Signing error", details: err.message });
-    }
+    // 2. Fetch shares from nodes
+    const shareResults = await Promise.all(
+      nodes.map(nodeUrl =>
+        fetchWithRetry(
+          `${nodeUrl}/get-share`,
+          {
+            method: "GET",
+            headers: {
+              "Content-Type": "application/json",
+              "X-API-Key": API_KEY,
+            }
+          }
+        )
+      )
+    );
 
-    // 4) Return signature + wallet address
+    const encryptedShares = shareResults.map(result => {
+      if (!result.share) {
+        throw new CoordinatorError(
+          "Node did not return share",
+          "MISSING_SHARE",
+          { result },
+          502
+        );
+      }
+      return result.share;
+    });
+
+    // 3. Sign message
+    const signature = await coordinatorCrypto.signMessageWithShares(
+      encryptedShares,
+      message
+    );
+
     res.json({
       signature,
       walletAddress: currentWallet.address,
     });
-  } catch (err) {
-    console.error("Error in /sign:", err);
-    res.status(500).json({ error: err.message });
+  } catch (error) {
+    next(error);
   }
 });
 
+// Error handling middleware
+app.use(errorHandler);
+
+// Start server
 https.createServer(httpsOptions, app).listen(3000, () => {
   console.log("Coordinator running on HTTPS :3000");
+  console.log("API Key:", API_KEY);
 });

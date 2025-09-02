@@ -2,219 +2,147 @@ import "dotenv/config";
 import express from "express";
 import https from "https";
 import fsSync from "fs";
-import { OAuth2Client } from "google-auth-library"; // Import OAuth2Client for Google JWT verification
+import { OAuth2Client } from "google-auth-library";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+
+class NodeError extends Error {
+  constructor(message, code = 'NODE_ERROR', details = {}, statusCode = 500) {
+    super(message);
+    this.code = code;
+    this.details = details;
+    this.statusCode = statusCode;
+  }
+}
 
 const app = express();
-app.use(express.json());
 
-// HTTPS options
+// Security middleware
+app.use(helmet());
+app.use(express.json());
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100
+}));
+
+// Configuration
 const httpsOptions = {
   key: fsSync.readFileSync("./certs/key.pem"),
   cert: fsSync.readFileSync("./certs/cert.pem"),
 };
 
-const API_KEY = process.env.API_KEY || "YOUR_COORDINATOR_API_KEY_HERE"; // API Key for inter-service communication
-
-// Accept one or more valid Google client IDs (audiences).
-// This lets Node1 verify ID tokens issued for the Main App (GOOGLE_CLIENT_ID_MAIN_APP)
-// as well as any other configured client ID.
+const API_KEY = process.env.API_KEY || "YOUR_COORDINATOR_API_KEY_HERE";
 const GOOGLE_CLIENT_IDS = [
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_ID_MAIN_APP,
 ].filter(Boolean);
 
 if (GOOGLE_CLIENT_IDS.length === 0) {
-  console.error("No GOOGLE_CLIENT_ID or GOOGLE_CLIENT_ID_MAIN_APP set in .env for Node 1.");
+  console.error("No Google Client IDs configured");
   process.exit(1);
 }
 
-// OAuth2Client can be instantiated without a client id; we'll pass the allowed
-// audiences to verifyIdToken so multiple audiences are accepted.
 const client = new OAuth2Client();
+const SHARE_FILE = `./node_share_${process.argv[2] || 3001}.enc`;
 
-console.log("Node 1 API Key:", API_KEY);
-console.log("Node 1 accepted Google client IDs (audiences):", GOOGLE_CLIENT_IDS);
-
-// Middleware for API Key authentication
+// Middleware
 const authenticateApiKey = (req, res, next) => {
   const apiKey = req.headers["x-api-key"];
   if (!apiKey || apiKey !== API_KEY) {
-    return res.status(401).json({ error: "Unauthorized: Invalid API Key" });
+    throw new NodeError("Invalid API Key", "INVALID_API_KEY", {}, 401);
   }
   next();
 };
 
-app.use(authenticateApiKey); // Apply authentication middleware to all routes
+const errorHandler = (err, req, res, next) => {
+  console.error("Error:", {
+    code: err.code,
+    message: err.message,
+    details: err.details,
+    stack: err.stack
+  });
 
-// Endpoint to validate Google JWT
-app.post("/validate-jwt", async (req, res) => {
+  res.status(err.statusCode || 500).json({
+    error: err.message,
+    code: err.code,
+    details: err.details
+  });
+};
+
+app.use(authenticateApiKey);
+
+// Routes
+app.post("/validate-jwt", async (req, res, next) => {
   try {
     const { token } = req.body;
     if (!token) {
-      return res.status(400).json({ error: "JWT token is required" });
+      throw new NodeError("JWT token is required", "MISSING_TOKEN", {}, 400);
     }
 
-    // Pass the accepted audiences array so tokens issued to any of these
-    // client IDs will validate.
     const ticket = await client.verifyIdToken({
       idToken: token,
       audience: GOOGLE_CLIENT_IDS,
     });
+    
     const payload = ticket.getPayload();
-    console.log("Validated token payload audience:", payload.aud);
-    const userid = payload["sub"];
-
-    console.log(`JWT from user ${userid} validated successfully.`);
-    res.json({ status: "valid", userid: userid, email: payload.email });
+    console.log(`JWT validated for user ${payload.sub}`);
+    
+    res.json({ 
+      status: "valid",
+      userid: payload.sub,
+      email: payload.email
+    });
   } catch (error) {
-    console.error("Error validating JWT:", error);
-    res
-      .status(401)
-      .json({ error: "Invalid JWT token", details: error.message });
+    next(new NodeError(
+      "JWT validation failed",
+      "INVALID_TOKEN",
+      { error: error.message },
+      401
+    ));
   }
 });
 
-const SHARE_FILE = `./node_share_${process.argv[2] || 3001}.enc`;
-
-// Return share
-app.get("/get-share", async (req, res) => {
+app.get("/get-share", async (req, res, next) => {
   try {
     const encryptedShare = await fsSync.readFileSync(SHARE_FILE, "utf8");
     res.json({ share: encryptedShare });
   } catch (err) {
     if (err.code === "ENOENT") {
-      return res.status(400).json({ error: "No share stored" });
+      next(new NodeError("No share stored", "NO_SHARE", {}, 404));
+    } else {
+      next(new NodeError(
+        "Error retrieving share",
+        "SHARE_READ_ERROR",
+        { error: err.message },
+        500
+      ));
     }
-    console.error("Error retrieving share:", err);
-    res.status(500).json({ error: err.message });
   }
 });
 
-// Store share
-app.post("/store", async (req, res) => {
+app.post("/store", async (req, res, next) => {
   try {
-    const share = req.body.share;
+    const { share } = req.body;
     if (!share) {
-      return res.status(400).json({ error: "Share is required" });
+      throw new NodeError("Share is required", "MISSING_SHARE", {}, 400);
     }
+
     await fsSync.writeFileSync(SHARE_FILE, share);
-    console.log("Stored share to file:", SHARE_FILE);
+    console.log("Share stored successfully");
     res.json({ status: "ok" });
   } catch (err) {
-    console.error("Error storing share:", err);
-    res.status(500).json({ error: err.message });
+    next(new NodeError(
+      "Error storing share",
+      "SHARE_WRITE_ERROR",
+      { error: err.message },
+      500
+    ));
   }
 });
 
-// --- New: request-sign / approve / reject / status on Node1 (with JWT verification) ---
-let pendingSignRequests = {};
-const APPROVAL_TIMEOUT_MS = 60 * 1000;
-
-app.post("/request-sign", async (req, res) => {
-  try {
-    const { message, requestId, token } = req.body;
-    if (!message || !requestId || !token) {
-      return res
-        .status(400)
-        .json({ error: "message, requestId and token are required" });
-    }
-
-    // verify token locally
-    try {
-      const ticket = await client.verifyIdToken({
-        idToken: token,
-        audience: GOOGLE_CLIENT_IDS,
-      });
-      const payload = ticket.getPayload();
-      console.log("Request-sign token valid for user:", payload.sub);
-    } catch (err) {
-      console.error("Request-sign token verification failed:", err.message);
-      return res.status(401).json({ error: "Invalid token", details: err.message });
-    }
-
-    if (pendingSignRequests[requestId]) {
-      return res.status(409).json({ error: "Request ID already exists" });
-    }
-
-    const timeoutId = setTimeout(() => {
-      if (
-        pendingSignRequests[requestId] &&
-        pendingSignRequests[requestId].status === "pending"
-      ) {
-        pendingSignRequests[requestId].status = "cancelled";
-        console.log(`Sign request ${requestId} cancelled due to timeout.`);
-      }
-    }, APPROVAL_TIMEOUT_MS);
-
-    pendingSignRequests[requestId] = {
-      message,
-      status: "pending",
-      timestamp: new Date(),
-      timeoutId,
-    };
-
-    console.log(`Node1 received sign request ${requestId} for "${message}".`);
-    console.log(
-      `Approve via: curl -k -X POST https://localhost:${process.argv[2] ||
-        3001}/approve/${requestId} -H "X-API-Key: ${API_KEY}"`
-    );
-
-    res.json({
-      status: "pending_approval",
-      requestId,
-      expires_in_ms:
-        APPROVAL_TIMEOUT_MS - (new Date() - pendingSignRequests[requestId].timestamp),
-    });
-  } catch (err) {
-    console.error("Error in /request-sign (node1):", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/approve/:requestId", (req, res) => {
-  const { requestId } = req.params;
-  if (!pendingSignRequests[requestId]) {
-    return res.status(404).json({ error: "Sign request not found" });
-  }
-  if (pendingSignRequests[requestId].status !== "pending") {
-    return res.status(409).json({ error: `Sign request already ${pendingSignRequests[requestId].status}` });
-  }
-  clearTimeout(pendingSignRequests[requestId].timeoutId);
-  pendingSignRequests[requestId].status = "approved";
-  console.log(`Sign request ${requestId} approved on Node1.`);
-  res.json({ status: "approved", requestId });
-});
-
-app.post("/reject/:requestId", (req, res) => {
-  const { requestId } = req.params;
-  if (!pendingSignRequests[requestId]) {
-    return res.status(404).json({ error: "Sign request not found" });
-  }
-  if (pendingSignRequests[requestId].status !== "pending") {
-    return res.status(409).json({ error: `Sign request already ${pendingSignRequests[requestId].status}` });
-  }
-  clearTimeout(pendingSignRequests[requestId].timeoutId);
-  pendingSignRequests[requestId].status = "rejected";
-  console.log(`Sign request ${requestId} rejected on Node1.`);
-  res.json({ status: "rejected", requestId });
-});
-
-app.get("/status/:requestId", (req, res) => {
-  const { requestId } = req.params;
-  if (!pendingSignRequests[requestId]) {
-    return res.status(404).json({ error: "Sign request not found" });
-  }
-  const { message, status, timestamp } = pendingSignRequests[requestId];
-  res.json({
-    requestId,
-    message,
-    status,
-    timestamp,
-    expires_in_ms: APPROVAL_TIMEOUT_MS - (new Date() - new Date(timestamp)),
-  });
-});
+app.use(errorHandler);
 
 const port = process.argv[2] || 3001;
 https.createServer(httpsOptions, app).listen(port, () => {
-  console.log(`Node running on HTTPS :${port}`);
+  console.log(`Node1 running on HTTPS :${port}`);
 });
