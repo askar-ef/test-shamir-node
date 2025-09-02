@@ -2,7 +2,6 @@ import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
-import { v4 as uuidv4 } from "uuid";
 import https from "https";
 import fs from "fs";
 import { CryptoEnclave } from "./crypto-enclave.mjs";

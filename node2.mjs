@@ -17,14 +17,8 @@ const httpsOptions = {
 };
 
 const API_KEY = process.env.API_KEY || "YOUR_COORDINATOR_API_KEY_HERE";
-const ENCRYPTION_KEY_HEX =
-  process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString("hex");
-
-// Initialize CryptoEnclave for this node (Node 2 acts as the enclave handler)
-const nodeCrypto = new CryptoEnclave(ENCRYPTION_KEY_HEX);
 
 console.log("Node 2 (Enclave) API Key:", API_KEY);
-console.log("Node 2 (Enclave) Encryption Key:", ENCRYPTION_KEY_HEX);
 
 // Middleware for API Key authentication
 const authenticateApiKey = (req, res, next) => {
@@ -41,29 +35,11 @@ const SHARE_FILE = `./node_share_${process.argv[2] || 3002}.enc`;
 
 // Node 2 is responsible for handling the enclave operations (storing shares and managing sign requests)
 
-// Store share
-app.post("/store", async (req, res) => {
-  try {
-    const share = req.body.share;
-    if (!share) {
-      return res.status(400).json({ error: "Share is required" });
-    }
-    const encryptedShare = nodeCrypto.encrypt(share);
-    await fs.writeFile(SHARE_FILE, encryptedShare);
-    console.log("Stored and encrypted share to file:", SHARE_FILE);
-    res.json({ status: "ok" });
-  } catch (err) {
-    console.error("Error storing share:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // Return share
 app.get("/get-share", async (req, res) => {
   try {
-    const encryptedShare = await fs.readFile(SHARE_FILE, "utf8");
-    const decryptedShare = nodeCrypto.decrypt(encryptedShare);
-    res.json({ share: decryptedShare });
+    const encryptedShare = await fsSync.readFileSync(SHARE_FILE, "utf8");
+    res.json({ share: encryptedShare });
   } catch (err) {
     if (err.code === "ENOENT") {
       return res.status(400).json({ error: "No share stored" });
@@ -72,6 +48,23 @@ app.get("/get-share", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Store share
+app.post("/store", async (req, res) => {
+  try {
+    const share = req.body.share;
+    if (!share) {
+      return res.status(400).json({ error: "Share is required" });
+    }
+    await fsSync.writeFileSync(SHARE_FILE, share);
+    console.log("Stored share to file:", SHARE_FILE);
+    res.json({ status: "ok" });
+  } catch (err) {
+    console.error("Error storing share:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // Store pending sign requests
 let pendingSignRequests = {};
