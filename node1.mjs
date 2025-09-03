@@ -3,8 +3,6 @@ import express from "express";
 import https from "https";
 import fsSync from "fs";
 import { OAuth2Client } from "google-auth-library";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
 
 class NodeError extends Error {
   constructor(message, code = 'NODE_ERROR', details = {}, statusCode = 500) {
@@ -17,13 +15,7 @@ class NodeError extends Error {
 
 const app = express();
 
-// Security middleware
-app.use(helmet());
 app.use(express.json());
-app.use(rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100
-}));
 
 // Configuration
 const httpsOptions = {
@@ -122,25 +114,9 @@ app.get("/get-share", async (req, res, next) => {
     let encryptedShare;
 
     // Try email-specific file first (new format)
-    try {
-      shareFile = getShareFilePath(email);
-      encryptedShare = await fsSync.readFileSync(shareFile, "utf8");
-      console.log(`Found email-specific share file: ${shareFile}`);
-    } catch (emailSpecificError) {
-      if (emailSpecificError.code === "ENOENT") {
-        // Fall back to old global file format for backward compatibility
-        const oldShareFile = `./node_share_${process.argv[2] || 3001}.enc`;
-        try {
-          encryptedShare = await fsSync.readFileSync(oldShareFile, "utf8");
-          console.log(`Using legacy share file: ${oldShareFile} for email: ${email}`);
-          shareFile = oldShareFile;
-        } catch (oldFileError) {
-          throw new NodeError("No share stored for this email", "NO_SHARE", {}, 404);
-        }
-      } else {
-        throw emailSpecificError;
-      }
-    }
+    shareFile = getShareFilePath(email);
+    encryptedShare = await fsSync.readFileSync(shareFile, "utf8");
+    console.log(`Found email-specific share file: ${shareFile}`);
 
     res.json({ share: encryptedShare });
   } catch (err) {
@@ -172,14 +148,10 @@ app.post("/store", async (req, res, next) => {
       // New format: email-specific file
       shareFile = getShareFilePath(email);
       console.log(`Storing share in email-specific file: ${shareFile}`);
-    } else {
-      // Legacy format: global file (for backward compatibility)
-      shareFile = `./node_share_${process.argv[2] || 3001}.enc`;
-      console.log(`Storing share in legacy file: ${shareFile}`);
-    }
+    } 
 
     await fsSync.writeFileSync(shareFile, share);
-    console.log(`Share stored successfully for ${email ? `email: ${email}` : 'legacy format'}`);
+    console.log(`Share stored successfully for ${email}`);
     res.json({ status: "ok" });
   } catch (err) {
     if (err instanceof NodeError) {

@@ -80,25 +80,9 @@ app.get("/get-share", async (req, res, next) => {
     let encryptedShare;
 
     // Try email-specific file first (new format)
-    try {
-      shareFile = getShareFilePath(email);
-      encryptedShare = await fsSync.readFileSync(shareFile, "utf8");
-      console.log(`Found email-specific share file: ${shareFile}`);
-    } catch (emailSpecificError) {
-      if (emailSpecificError.code === "ENOENT") {
-        // Fall back to old global file format for backward compatibility
-        const oldShareFile = `./node_share_${process.argv[2] || 3002}.enc`;
-        try {
-          encryptedShare = await fsSync.readFileSync(oldShareFile, "utf8");
-          console.log(`Using legacy share file: ${oldShareFile} for email: ${email}`);
-          shareFile = oldShareFile;
-        } catch (oldFileError) {
-          throw new NodeError("No share stored for this email", "NO_SHARE", {}, 404);
-        }
-      } else {
-        throw emailSpecificError;
-      }
-    }
+    shareFile = getShareFilePath(email);
+    encryptedShare = await fsSync.readFileSync(shareFile, "utf8");
+    console.log(`Found email-specific share file: ${shareFile}`);
 
     res.json({ share: encryptedShare });
   } catch (err) {
@@ -130,11 +114,7 @@ app.post("/store", async (req, res, next) => {
       // New format: email-specific file
       shareFile = getShareFilePath(email);
       console.log(`Storing share in email-specific file: ${shareFile}`);
-    } else {
-      // Legacy format: global file (for backward compatibility)
-      shareFile = `./node_share_${process.argv[2] || 3002}.enc`;
-      console.log(`Storing share in legacy file: ${shareFile}`);
-    }
+    } 
 
     await fsSync.writeFileSync(shareFile, share);
     console.log(`Share stored successfully for ${email ? `email: ${email}` : 'legacy format'}`);
